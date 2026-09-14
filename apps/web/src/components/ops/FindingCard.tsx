@@ -56,6 +56,41 @@ export function FindingCard({ finding, onOpenPage, onDismiss, onFollowUp }: Find
       <div className="mt-1.5" style={{ fontSize: 12.5, color: 'var(--text-default)', lineHeight: '18px' }}>
         {finding.detail}
       </div>
+      {finding.evidence && finding.evidence.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1">
+          {finding.evidence.map((ev, i) => (
+            <div
+              key={`${ev.page}-${i}`}
+              className="pl-2"
+              style={{
+                borderLeft: `2px solid ${ev.verified ? color : 'var(--hairline)'}`,
+                fontSize: 11.5,
+                lineHeight: '16px',
+                opacity: ev.verified ? 1 : 0.6,
+              }}
+              data-testid="finding-evidence"
+            >
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => onOpenPage(ev.page)}
+                  className="cursor-pointer text-left"
+                  style={{ fontSize: 10.5, color: 'var(--accent)', fontFamily: 'ui-monospace, monospace' }}
+                  data-testid="finding-evidence-page"
+                >
+                  {ev.page}
+                </button>
+                <span
+                  style={{ fontSize: 10, fontWeight: 600, color: ev.verified ? 'var(--success, #34a853)' : 'var(--text-faint)' }}
+                  data-testid={ev.verified ? 'finding-evidence-verified' : 'finding-evidence-unverified'}
+                >
+                  {ev.verified ? '✓ verified' : 'unverified'}
+                </span>
+              </div>
+              <div style={{ fontStyle: 'italic', color: 'var(--text-mid)' }}>“{ev.quote}”</div>
+            </div>
+          ))}
+        </div>
+      )}
       {finding.pages.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">
           {finding.pages.map((pg) => (

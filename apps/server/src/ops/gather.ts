@@ -17,7 +17,11 @@ export async function gatherProjectCore(root: string): Promise<ProjectCore> {
   return { context, indexYaml, readme };
 }
 
-async function listFilesRec(dir: string, rel: string): Promise<string[]> {
+async function listFilesRec(
+  dir: string,
+  rel: string,
+  keep: (name: string) => boolean = (name) => name.endsWith('.md') && !name.endsWith('.extracted.md'),
+): Promise<string[]> {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
@@ -26,10 +30,19 @@ async function listFilesRec(dir: string, rel: string): Promise<string[]> {
   }
   const out: string[] = [];
   for (const e of entries) {
-    if (e.isDirectory()) out.push(...(await listFilesRec(join(dir, e.name), `${rel}/${e.name}`)));
-    else if (e.name.endsWith('.md') && !e.name.endsWith('.extracted.md')) out.push(`${rel}/${e.name}`);
+    if (e.isDirectory()) out.push(...(await listFilesRec(join(dir, e.name), `${rel}/${e.name}`, keep)));
+    else if (keep(e.name)) out.push(`${rel}/${e.name}`);
   }
   return out;
+}
+
+/**
+ * Citation syntax in AI-written pages: `[@<project-relative-path>]`, e.g.
+ * `[@sources/contributors/haobing/2026-08-19.md]`. Unique, trimmed, in
+ * order of first appearance. No code-fence stripping — keep it simple.
+ */
+export function parseCitations(body: string): string[] {
+  return [...new Set([...body.matchAll(/\[@([^\]\s]+)\]/g)].map((m) => m[1]!.trim()).filter(Boolean))];
 }
 
 /**
@@ -43,6 +56,8 @@ export interface ResearchPage {
   excerpt: string;
   outbound: string[];
   inboundCount: number;
+  /** Project-relative source paths cited via `[@path]`. */
+  cites: string[];
 }
 
 const MAX_LINT_PAGES = 40;
@@ -61,7 +76,7 @@ export async function gatherResearchPages(root: string): Promise<ResearchPage[]>
       const body = await readFile(join(root, rel), 'utf-8').catch(() => '');
       const outbound = [...new Set([...body.matchAll(/\[\[([^\]|#]+)/g)].map((m) => m[1]!.trim()))];
       const slug = (rel.split('/').pop() ?? rel).replace(/\.md$/, '');
-      return { path: rel, slug, excerpt: body.slice(0, MAX_EXCERPT_CHARS), outbound, inboundCount: 0 };
+      return { path: rel, slug, excerpt: body.slice(0, MAX_EXCERPT_CHARS), outbound, inboundCount: 0, cites: parseCitations(body) };
     }),
   );
   const bySlug = new Map(pages.map((p) => [p.slug, p]));
@@ -70,6 +85,40 @@ export async function gatherResearchPages(root: string): Promise<ResearchPage[]>
     if (hit && hit !== p) hit.inboundCount += 1;
   }
   return pages;
+}
+
+export interface SourceStat {
+  path: string;
+  /** Citations from research pages + context.md pointing at this source. */
+  citedBy: number;
+  mtimeMs: number;
+}
+
+const MAX_SOURCE_STATS = 400;
+
+/**
+ * Every user-provided source (contributor `*.md` + raw `*.extracted.md`)
+ * with a deterministic cited-by count, newest first. Feeds the lint
+ * `uncited_source` check and the prompt's SOURCES section.
+ */
+export async function gatherSourceStats(root: string, pages: ResearchPage[]): Promise<SourceStat[]> {
+  const [contributors, raw, context] = await Promise.all([
+    listFilesRec(join(root, 'sources', 'contributors'), 'sources/contributors', (n) => n.endsWith('.md')),
+    listFilesRec(join(root, 'sources', 'raw'), 'sources/raw', (n) => n.endsWith('.extracted.md')),
+    readFile(join(root, 'context.md'), 'utf-8').catch(() => ''),
+  ]);
+  const counts = new Map<string, number>();
+  for (const cited of [...pages.flatMap((p) => p.cites), ...parseCitations(context)]) {
+    counts.set(cited, (counts.get(cited) ?? 0) + 1);
+  }
+  const stats = await Promise.all(
+    [...contributors, ...raw].map(async (rel) => ({
+      path: rel,
+      citedBy: counts.get(rel) ?? 0,
+      mtimeMs: await stat(join(root, rel)).then((s) => s.mtimeMs).catch(() => 0),
+    })),
+  );
+  return stats.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, MAX_SOURCE_STATS);
 }
 
 export async function gatherUnbuiltSources(root: string): Promise<SourceFile[]> {

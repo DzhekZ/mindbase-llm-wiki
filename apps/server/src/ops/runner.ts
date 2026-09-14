@@ -3,12 +3,15 @@
 // The single orchestration engine for server-side operations:
 // gather → one constrained LLM completion → (checkpoint) → validate →
 // apply via executors → append to logs/<date>.md → emit SSE events.
-import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { applyActions } from './executors';
 import { completeJson, OpLlmError, type LlmCtx } from './llm';
-import { gatherProjectCore, gatherResearchPages, gatherUnbuiltSources } from './gather';
+import {
+  gatherProjectCore, gatherResearchPages, gatherSourceStats, gatherUnbuiltSources,
+  type ResearchPage, type SourceStat,
+} from './gather';
 import { contributePrompt, contributePlanSchema, type RelatedPage } from './recipes/contribute';
 import { buildPrompt, buildSchema } from './recipes/build';
 import { lintPrompt, lintSchema, type Finding } from './recipes/lint';
@@ -16,9 +19,17 @@ import { researchPrompt, researchSchema, type ResearchSource } from './recipes/r
 import { braveSearchSources } from './web-search';
 import type { Action } from './types';
 
-export interface StoredFinding extends Finding {
+export interface VerifiedEvidence {
+  page: string;
+  quote: string;
+  /** True when the quote was found verbatim (after normalization) in `page`. */
+  verified: boolean;
+}
+
+export interface StoredFinding extends Omit<Finding, 'evidence'> {
   id: string;
   dismissed: boolean;
+  evidence?: VerifiedEvidence[];
 }
 
 export type OpEvent =
@@ -162,7 +173,117 @@ export async function runResearch(ctx: OpsCtx, topic: string, emit: (e: OpEvent)
 
 // --- lint: emits findings, never writes to the wiki ---
 
-interface LintArtifact { date: string; findings: StoredFinding[] }
+interface LintArtifact {
+  date: string;
+  findings: StoredFinding[];
+  /** Model findings discarded because their evidence quotes did not verify. Absent on pre-evidence artifacts. */
+  dropped?: number;
+}
+
+const normalizeContextPath = (p: string): string => (/^\.?\/?context\.md$/i.test(p.trim()) ? 'context.md' : p.trim());
+
+/**
+ * Resolve a model-supplied page label to a project-relative file that exists:
+ * exact relative path → context.md (any casing, optional ./) → bare slug or
+ * `sources/research/<slug>` → `sources/research/<slug>.md`.
+ */
+async function resolvePageFile(root: string, page: string): Promise<string | null> {
+  const label = normalizeContextPath(page);
+  const exists = (rel: string) => stat(join(root, rel)).then((s) => s.isFile()).catch(() => false);
+  if (await exists(label)) return label;
+  const slug = label.replace(/^sources\/research\//, '').replace(/\.md$/, '');
+  if (slug && !slug.includes('/')) {
+    const rel = `sources/research/${slug}.md`;
+    if (await exists(rel)) return rel;
+  }
+  return null;
+}
+
+/** Lowercase, strip emphasis/backticks, collapse whitespace — so a quote survives light markdown drift. */
+const normalizeQuote = (s: string): string => s.toLowerCase().replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim();
+
+const MIN_VERIFIED: Partial<Record<Finding['kind'], number>> = { contradiction: 2, stale: 1 };
+
+/**
+ * Check every evidence quote against the page it claims to come from.
+ * Contradictions need ≥2 verified quotes and stale claims ≥1, otherwise the
+ * finding is dropped — the model must not be allowed to invent conflicts.
+ * Other kinds are kept with per-item `verified` flags attached.
+ */
+export async function verifyEvidence(
+  root: string,
+  findings: Array<Omit<StoredFinding, 'evidence'> & { evidence?: Array<{ page: string; quote: string }> }>,
+): Promise<{ kept: StoredFinding[]; dropped: number }> {
+  const bodyCache = new Map<string, Promise<string | null>>();
+  const bodyOf = (page: string): Promise<string | null> => {
+    const key = normalizeContextPath(page);
+    let hit = bodyCache.get(key);
+    if (!hit) {
+      hit = resolvePageFile(root, key).then((rel) =>
+        rel ? readFile(join(root, rel), 'utf-8').then(normalizeQuote).catch(() => null) : null,
+      );
+      bodyCache.set(key, hit);
+    }
+    return hit;
+  };
+
+  const kept: StoredFinding[] = [];
+  let dropped = 0;
+  for (const f of findings) {
+    const evidence = f.evidence
+      ? await Promise.all(
+        f.evidence.map(async (e) => {
+          const haystack = await bodyOf(e.page);
+          return { page: e.page, quote: e.quote, verified: haystack !== null && haystack.includes(normalizeQuote(e.quote)) };
+        }),
+      )
+      : undefined;
+    const need = MIN_VERIFIED[f.kind];
+    const verifiedCount = evidence?.filter((e) => e.verified).length ?? 0;
+    if (need !== undefined && verifiedCount < need) {
+      dropped += 1;
+      continue;
+    }
+    const { evidence: _raw, ...rest } = f;
+    kept.push(evidence ? { ...rest, evidence } : rest);
+  }
+  return { kept, dropped };
+}
+
+const MAX_DETERMINISTIC_PER_KIND = 8;
+
+/**
+ * Findings computed from citation data without the model: research pages
+ * that cite nothing, and sources that were built over (older than
+ * context.md) yet never cited anywhere. Skips `uncited_source` entirely when
+ * there is no context.md to compare against.
+ */
+function deterministicFindings(pages: ResearchPage[], sources: SourceStat[], contextMtimeMs: number | null): StoredFinding[] {
+  const unsourced = pages
+    .filter((p) => p.cites.length === 0)
+    .slice(0, MAX_DETERMINISTIC_PER_KIND)
+    .map<StoredFinding>((p) => ({
+      kind: 'unsourced_page',
+      pages: [p.path],
+      detail: 'This research page cites no source (no [@path] citations). Add the sources it was synthesized from.',
+      id: randomUUID(),
+      dismissed: false,
+    }));
+  const uncited = contextMtimeMs === null
+    ? []
+    : sources
+      .filter((s) => s.citedBy === 0 && s.mtimeMs < contextMtimeMs)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, MAX_DETERMINISTIC_PER_KIND)
+      .map<StoredFinding>((s) => ({
+        kind: 'uncited_source',
+        pages: [s.path],
+        detail: 'Built over but never cited by any research page or context.md.',
+        id: randomUUID(),
+        dismissed: false,
+      }));
+  return [...unsourced, ...uncited];
+}
 
 const lintDir = (root: string) => join(root, 'artifacts', 'lint');
 
@@ -193,30 +314,44 @@ export async function dismissLintFinding(root: string, id: string): Promise<bool
 export async function runLint(ctx: OpsCtx, emit: (e: OpEvent) => void): Promise<void> {
   try {
     emit({ kind: 'phase', phase: 'reading project' });
-    const [core, pages] = await Promise.all([
+    const [core, pages, contextMtimeMs] = await Promise.all([
       gatherProjectCore(ctx.projectRoot),
       gatherResearchPages(ctx.projectRoot),
+      stat(join(ctx.projectRoot, 'context.md')).then((s) => s.mtimeMs).catch(() => null),
     ]);
     if (!core.context.trim() && pages.length === 0) {
       emit({ kind: 'error', error: 'Nothing to lint yet — contribute a thought or two first.' });
       return;
     }
+    const sources = await gatherSourceStats(ctx.projectRoot, pages);
     emit({ kind: 'phase', phase: `checking ${pages.length} pages with ${ctx.config.model}` });
-    const { system, user } = lintPrompt({ core, pages });
+    const { system, user } = lintPrompt({ core, pages, sources });
     const out = await completeJson(ctx, { system, user, schema: lintSchema, maxTokens: 4096 });
 
     const date = new Date().toISOString().slice(0, 10);
-    const findings: StoredFinding[] = out.findings.map((f) => ({
-      ...f,
-      // Models sometimes echo path labels with different casing/prefixes;
-      // normalize so the UI's page links resolve.
-      pages: f.pages.map((p) => (/^\.?\/?context\.md$/i.test(p.trim()) ? 'context.md' : p.trim())),
-      id: randomUUID(),
-      dismissed: false,
-    }));
+    // The model is told not to emit deterministic kinds; drop any it sends
+    // so they never bypass the code-computed versions below.
+    const modelFindings = out.findings
+      .filter((f) => f.kind !== 'unsourced_page' && f.kind !== 'uncited_source')
+      .map((f) => ({
+        ...f,
+        // Models sometimes echo path labels with different casing/prefixes;
+        // normalize so the UI's page links resolve.
+        pages: f.pages.map(normalizeContextPath),
+        id: randomUUID(),
+        dismissed: false,
+      }));
+    emit({ kind: 'phase', phase: 'verifying evidence' });
+    const { kept, dropped } = await verifyEvidence(ctx.projectRoot, modelFindings);
+    const findings: StoredFinding[] = [...kept, ...deterministicFindings(pages, sources, contextMtimeMs)];
+    const artifact: LintArtifact = { date, findings, dropped };
     await mkdir(lintDir(ctx.projectRoot), { recursive: true });
-    await writeFile(join(lintDir(ctx.projectRoot), `${date}.json`), JSON.stringify({ date, findings }, null, 2), 'utf-8');
-    await appendOpLog(ctx.projectRoot, 'lint', `${findings.length} findings, pages=${pages.length} (ui)`);
+    await writeFile(join(lintDir(ctx.projectRoot), `${date}.json`), JSON.stringify(artifact, null, 2), 'utf-8');
+    await appendOpLog(
+      ctx.projectRoot,
+      'lint',
+      `${findings.length} findings, pages=${pages.length} (ui)${dropped > 0 ? `, dropped=${dropped}` : ''}`,
+    );
     emit({ kind: 'findings', date, findings });
     emit({ kind: 'done' });
   } catch (e) {

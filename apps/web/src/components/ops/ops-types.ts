@@ -8,7 +8,15 @@ export type OpAction =
 
 export type FindingKind =
   | 'contradiction' | 'stale' | 'orphan' | 'missing_page'
-  | 'missing_link' | 'gap' | 'question';
+  | 'missing_link' | 'gap' | 'question'
+  | 'unsourced_page' | 'uncited_source';
+
+export interface FindingEvidence {
+  page: string;
+  quote: string;
+  /** Server-verified: the quote was found verbatim in `page`. */
+  verified: boolean;
+}
 
 export interface Finding {
   id: string;
@@ -16,6 +24,7 @@ export interface Finding {
   pages: string[];
   detail: string;
   dismissed: boolean;
+  evidence?: FindingEvidence[];
 }
 
 export type OpEvent =
@@ -36,6 +45,8 @@ export const FINDING_LABEL: Record<FindingKind, string> = {
   missing_link: 'missing link',
   gap: 'gap',
   question: 'question',
+  unsourced_page: 'unsourced page',
+  uncited_source: 'uncited source',
 };
 
 export const FINDING_COLOR: Record<FindingKind, string> = {
@@ -46,6 +57,8 @@ export const FINDING_COLOR: Record<FindingKind, string> = {
   missing_link: '#5e76f0',
   gap: '#b08fe8',
   question: '#34a853',
+  unsourced_page: '#e8a13c',
+  uncited_source: '#8e8e93',
 };
 
 export function actionTarget(a: OpAction): string {

@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { gatherProjectCore, gatherUnbuiltSources } from './gather';
+import { gatherProjectCore, gatherUnbuiltSources, gatherResearchPages, gatherSourceStats, parseCitations } from './gather';
 import { completeJson } from './llm';
 import type { ChatChunk, ChatMessage } from '@mindbase/core';
 
@@ -44,6 +44,66 @@ describe('gatherUnbuiltSources', () => {
     await touch('sources/research/a.extracted.md', 'sidecar', 1000);
     const s = await gatherUnbuiltSources(root);
     expect(s.map((f) => f.path)).toEqual(['sources/research/a.md']);
+  });
+});
+
+describe('parseCitations', () => {
+  it('extracts unique trimmed [@path] citations and ignores empty ones', () => {
+    const body = 'See [@sources/contributors/u/2026-08-19.md] and [@sources/raw/2026-08-01/x.extracted.md].\n' +
+      'Again [@sources/contributors/u/2026-08-19.md]. Empty [@] is skipped.';
+    expect(parseCitations(body)).toEqual([
+      'sources/contributors/u/2026-08-19.md',
+      'sources/raw/2026-08-01/x.extracted.md',
+    ]);
+  });
+
+  it('returns [] when there are no citations', () => {
+    expect(parseCitations('plain [[wikilink]] text')).toEqual([]);
+  });
+});
+
+describe('gatherResearchPages', () => {
+  it('collects cites per page', async () => {
+    await touch('sources/research/a.md', '# A\n\nclaim [@sources/contributors/u/2026-01-01.md] [[b]]', 1000);
+    await touch('sources/research/b.md', '# B\n\nno cites', 1000);
+    const pages = await gatherResearchPages(root);
+    const a = pages.find((p) => p.slug === 'a')!;
+    const b = pages.find((p) => p.slug === 'b')!;
+    expect(a.cites).toEqual(['sources/contributors/u/2026-01-01.md']);
+    expect(a.outbound).toEqual(['b']);
+    expect(b.cites).toEqual([]);
+    expect(b.inboundCount).toBe(1);
+  });
+});
+
+describe('gatherSourceStats', () => {
+  it('counts citations from research pages and context.md; uncited sources get 0', async () => {
+    await touch('context.md', '# ctx\n\n- fact [@sources/contributors/u/2026-01-02.md]', 5000);
+    await touch('sources/contributors/u/2026-01-01.md', 'day one', 1000);
+    await touch('sources/contributors/u/2026-01-02.md', 'day two', 2000);
+    await touch('sources/contributors/u/notes/idea.md', 'a note', 3000);
+    await touch('sources/raw/2026-01-03/abc.extracted.md', 'extracted text', 4000);
+    await touch('sources/raw/2026-01-03/abc.pdf', 'binary-ish', 4000);
+    await touch('sources/research/r.md', '# R\n\n[@sources/contributors/u/2026-01-01.md] [@sources/contributors/u/2026-01-02.md] [@sources/raw/2026-01-03/abc.extracted.md]', 6000);
+    const pages = await gatherResearchPages(root);
+    const stats = await gatherSourceStats(root, pages);
+    // newest mtime first; raw binary and research pages are not sources
+    expect(stats.map((s) => s.path)).toEqual([
+      'sources/raw/2026-01-03/abc.extracted.md',
+      'sources/contributors/u/notes/idea.md',
+      'sources/contributors/u/2026-01-02.md',
+      'sources/contributors/u/2026-01-01.md',
+    ]);
+    const by = Object.fromEntries(stats.map((s) => [s.path, s.citedBy]));
+    expect(by['sources/contributors/u/2026-01-02.md']).toBe(2); // research + context.md
+    expect(by['sources/contributors/u/2026-01-01.md']).toBe(1);
+    expect(by['sources/raw/2026-01-03/abc.extracted.md']).toBe(1);
+    expect(by['sources/contributors/u/notes/idea.md']).toBe(0);
+    expect(stats.find((s) => s.path === 'sources/contributors/u/2026-01-01.md')!.mtimeMs).toBe(1000 * 1000);
+  });
+
+  it('returns [] when no source dirs exist', async () => {
+    expect(await gatherSourceStats(root, [])).toEqual([]);
   });
 });
 

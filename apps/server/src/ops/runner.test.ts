@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runContributePlan, applyContributePlan, runBuild, runLint, runResearch,
-  latestLintArtifact, dismissLintFinding,
-  type OpEvent, type OpsCtx,
+  latestLintArtifact, dismissLintFinding, verifyEvidence,
+  type OpEvent, type OpsCtx, type StoredFinding,
 } from './runner';
 import type { ChatChunk, ChatMessage } from '@mindbase/core';
 
@@ -166,7 +166,8 @@ describe('lint', () => {
   });
 
   it('emits findings, caches artifact, logs — and never writes wiki files', async () => {
-    await writeFile(join(root, 'sources', 'research', 'lonely.md'), '# Lonely\n\nno links here', 'utf-8');
+    // Cited so the deterministic unsourced_page check stays quiet here.
+    await writeFile(join(root, 'sources', 'research', 'lonely.md'), '# Lonely\n\nno links here [@sources/contributors/u/x.md]', 'utf-8');
     const contextBefore = await readFile(join(root, 'context.md'), 'utf-8');
     const c = collect();
     await runLint(scriptedCtx([lintJson]), c.emit);
@@ -198,5 +199,155 @@ describe('lint', () => {
     const c = collect();
     await runLint(scriptedCtx([lintJson]), c.emit);
     expect(c.events.some((e) => e.kind === 'error' && /Nothing to lint/.test(e.error))).toBe(true);
+  });
+});
+
+describe('lint evidence verification', () => {
+  const CITE = '[@sources/contributors/u/2026-01-01.md]';
+
+  async function twoPages() {
+    await writeFile(join(root, 'sources', 'research', 'a.md'), `# A\n\nThe launch is scheduled for **March 2027**. ${CITE}\n`, 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'b.md'), `# B\n\nThe launch is scheduled for June 2027, per the CEO. ${CITE}\n`, 'utf-8');
+  }
+
+  function findingsOf(events: OpEvent[]): StoredFinding[] {
+    const ev = events.find((e) => e.kind === 'findings');
+    return ev && ev.kind === 'findings' ? ev.findings : [];
+  }
+
+  it('(a) contradiction with 2 verbatim quotes is kept with verified:true', async () => {
+    await twoPages();
+    const out = JSON.stringify({ findings: [{
+      kind: 'contradiction', pages: ['sources/research/a.md', 'b'], detail: 'Launch dates disagree.',
+      evidence: [
+        { page: 'sources/research/a.md', quote: 'launch is scheduled for March 2027' },
+        { page: 'b', quote: 'The  launch is scheduled for *June 2027*' },
+      ],
+    }] });
+    const c = collect();
+    await runLint(scriptedCtx([out]), c.emit);
+    const f = findingsOf(c.events);
+    const contradiction = f.find((x) => x.kind === 'contradiction');
+    expect(contradiction).toBeTruthy();
+    expect(contradiction!.evidence?.map((e) => e.verified)).toEqual([true, true]);
+    const artifact = await latestLintArtifact(root);
+    expect(artifact?.dropped).toBe(0);
+  });
+
+  it('(b) contradiction with a fabricated quote is dropped and counted', async () => {
+    await twoPages();
+    const out = JSON.stringify({ findings: [
+      {
+        kind: 'contradiction', pages: ['sources/research/a.md', 'sources/research/b.md'], detail: 'Fabricated.',
+        evidence: [
+          { page: 'sources/research/a.md', quote: 'launch is scheduled for March 2027' },
+          { page: 'sources/research/b.md', quote: 'the launch was cancelled entirely' },
+        ],
+      },
+      { kind: 'orphan', pages: ['sources/research/a.md'], detail: 'No inbound links.' },
+    ] });
+    const c = collect();
+    await runLint(scriptedCtx([out]), c.emit);
+    const f = findingsOf(c.events);
+    expect(f.some((x) => x.kind === 'contradiction')).toBe(false);
+    expect(f.some((x) => x.kind === 'orphan')).toBe(true);
+    const artifact = await latestLintArtifact(root);
+    expect(artifact?.dropped).toBe(1);
+    const log = await readFile(join(root, 'logs', `${new Date().toISOString().slice(0, 10)}.md`), 'utf-8');
+    expect(log).toMatch(/lint \| 1 findings, pages=2 \(ui\), dropped=1/);
+  });
+
+  it('(c) stale with one real quote is kept', async () => {
+    await twoPages();
+    const out = JSON.stringify({ findings: [{
+      kind: 'stale', pages: ['sources/research/a.md'], detail: 'Superseded by b.',
+      evidence: [{ page: 'a', quote: 'scheduled for March 2027' }],
+    }] });
+    const c = collect();
+    await runLint(scriptedCtx([out]), c.emit);
+    const stale = findingsOf(c.events).find((x) => x.kind === 'stale');
+    expect(stale?.evidence).toEqual([{ page: 'a', quote: 'scheduled for March 2027', verified: true }]);
+  });
+
+  it('(d) question with unverifiable evidence is kept, flagged verified:false', async () => {
+    await twoPages();
+    const out = JSON.stringify({ findings: [{
+      kind: 'question', pages: ['CONTEXT.MD'], detail: 'Who owns the launch?',
+      evidence: [{ page: './Context.md', quote: 'this text is nowhere in context' }],
+    }] });
+    const c = collect();
+    await runLint(scriptedCtx([out]), c.emit);
+    const q = findingsOf(c.events).find((x) => x.kind === 'question');
+    expect(q?.pages).toEqual(['context.md']);
+    expect(q?.evidence?.[0]?.verified).toBe(false);
+    expect((await latestLintArtifact(root))?.dropped).toBe(0);
+  });
+
+  it('verifyEvidence resolves context.md case-insensitively and normalizes markdown', async () => {
+    await writeFile(join(root, 'context.md'), '# T\n\n- We use `pnpm`   for _everything_.\n', 'utf-8');
+    const base = { id: '1', dismissed: false, pages: ['context.md'], detail: 'd' };
+    const { kept, dropped } = await verifyEvidence(root, [
+      { ...base, kind: 'stale', evidence: [{ page: 'CONTEXT.md', quote: 'we use pnpm for everything' }] },
+      { ...base, id: '2', kind: 'stale', evidence: [{ page: 'context.md', quote: 'we use yarn for everything' }] },
+      { ...base, id: '3', kind: 'contradiction', evidence: [{ page: 'context.md', quote: 'we use pnpm for everything' }] },
+      { ...base, id: '4', kind: 'gap' },
+    ]);
+    expect(kept.map((k) => k.id)).toEqual(['1', '4']);
+    expect(dropped).toBe(2);
+    expect(kept[0]!.evidence?.[0]?.verified).toBe(true);
+  });
+});
+
+describe('lint deterministic findings', () => {
+  const noFindings = JSON.stringify({ findings: [] });
+  const dayAgo = Math.floor(Date.now() / 1000) - 86_400;
+
+  it('(e) research page without citations → unsourced_page, after model findings', async () => {
+    await writeFile(join(root, 'sources', 'research', 'sourced.md'), '# S\n\nclaim [@sources/contributors/u/2026-01-01.md]\n', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'bare.md'), '# Bare\n\nno citations at all\n', 'utf-8');
+    const out = JSON.stringify({ findings: [{ kind: 'orphan', pages: ['sources/research/bare.md'], detail: 'Nothing links here.' }] });
+    const c = collect();
+    await runLint(scriptedCtx([out]), c.emit);
+    const ev = c.events.find((e) => e.kind === 'findings');
+    const f = ev && ev.kind === 'findings' ? ev.findings : [];
+    expect(f.map((x) => x.kind)).toEqual(['orphan', 'unsourced_page']);
+    expect(f[1]!.pages).toEqual(['sources/research/bare.md']);
+    expect(f[1]!.id).toBeTruthy();
+    expect(f[1]!.dismissed).toBe(false);
+    expect(f[1]!.evidence).toBeUndefined();
+  });
+
+  it('(f) contributor file older than context.md with no citations → uncited_source; cited one is not emitted', async () => {
+    const cited = join(root, 'sources', 'contributors', 'u', '2026-01-01.md');
+    const uncited = join(root, 'sources', 'contributors', 'u', '2026-01-02.md');
+    const fresh = join(root, 'sources', 'contributors', 'u', '2026-01-03.md');
+    await writeFile(cited, 'day one', 'utf-8');
+    await writeFile(uncited, 'day two', 'utf-8');
+    await writeFile(fresh, 'day three (newer than context.md — not built yet)', 'utf-8');
+    await utimes(cited, dayAgo, dayAgo);
+    await utimes(uncited, dayAgo, dayAgo);
+    await utimes(fresh, dayAgo + 2 * 86_400, dayAgo + 2 * 86_400);
+    await writeFile(join(root, 'sources', 'research', 'r.md'), '# R\n\nclaim [@sources/contributors/u/2026-01-01.md]\n', 'utf-8');
+    const c = collect();
+    await runLint(scriptedCtx([noFindings]), c.emit);
+    const ev = c.events.find((e) => e.kind === 'findings');
+    const f = ev && ev.kind === 'findings' ? ev.findings : [];
+    const uncitedFindings = f.filter((x) => x.kind === 'uncited_source');
+    expect(uncitedFindings.map((x) => x.pages[0])).toEqual(['sources/contributors/u/2026-01-02.md']);
+    expect(f.some((x) => x.kind === 'unsourced_page')).toBe(false);
+  });
+
+  it('skips uncited_source entirely when context.md is missing', async () => {
+    const { rm } = await import('node:fs/promises');
+    await rm(join(root, 'context.md'));
+    const old = join(root, 'sources', 'contributors', 'u', '2026-01-02.md');
+    await writeFile(old, 'day two', 'utf-8');
+    await utimes(old, dayAgo, dayAgo);
+    await writeFile(join(root, 'sources', 'research', 'r.md'), '# R\n\n[@sources/contributors/u/zzz.md]\n', 'utf-8');
+    const c = collect();
+    await runLint(scriptedCtx([noFindings]), c.emit);
+    const ev = c.events.find((e) => e.kind === 'findings');
+    const f = ev && ev.kind === 'findings' ? ev.findings : [];
+    expect(f.some((x) => x.kind === 'uncited_source')).toBe(false);
   });
 });
