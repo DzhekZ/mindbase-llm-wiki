@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.5 (2026-09-13)
+
+### Added — wiki integrity (ideas from the Karpathy LLM-wiki thread)
+
+- **Sources vs wiki in answers** — retrieval indexes your own notes,
+  daily files and raw imports as a `source` layer alongside AI-written
+  pages; answers prefer your material, and each citation is tagged
+  `source` / `wiki` so you can see what is yours vs derived.
+- **`[@path]` citations** — every research page and context bullet the
+  maintainer writes points back at the source file it came from, added
+  deterministically even when the model forgets. Rendered as clickable
+  chips in notes and on the wiki home. Lint gains `unsourced page` and
+  `uncited source` findings, computed in code rather than by the model.
+- **Evidence-checked lint** — contradiction / stale findings must carry
+  verbatim quotes; the server verifies each quote against the page and
+  drops findings that don't hold up (`dropped=N` in the log). Cards show
+  `✓ verified` per quote.
+- **Free-text contribute lands in your layer first** — `/contribute`
+  text is appended to `sources/contributors/<you>/<date>.md` before the
+  wiki is touched, so it is citable and never lost; re-submitting the
+  same text is a no-op. Notes cite their own path.
+- **Duplicate-page guard** — a plan cannot create a research page that
+  already exists (case/separator-insensitive) or that another pending
+  plan is about to create; the approval card says what was skipped.
+- **State rule** in build / contribute / research prompts: document the
+  shape of things, never live values (SHAs, counts, "last synced").
+
 ## 0.4.3 (2026-08-19)
 
 ### Added
