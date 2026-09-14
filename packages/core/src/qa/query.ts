@@ -1,7 +1,7 @@
 import type { LLMAdapter } from '../adapters/types';
 import type { ChatMessage, ChatRequest, MetaJson, ToolCall } from '../types';
 import type { Store } from '../storage/store';
-import type { SearchIndex } from '../search/index';
+import type { SearchIndex, SearchResult } from '../search/index';
 import { readIndex } from '../compile/index_md';
 import { conceptMetaPath } from '../storage/paths';
 
@@ -28,6 +28,8 @@ export interface CitedSource {
   title: string;
   path: string;
   one_liner: string;
+  /** 'source' = user-written / captured material; 'wiki' = AI-written synthesis. */
+  layer: 'source' | 'wiki';
 }
 
 export type QAEvent =
@@ -64,7 +66,9 @@ Multi-source claim: [1][3]. Single-source claim: [1]. Place markers at end of se
 
 If you cannot cite a claim from the sources provided, do not state the claim. If the wiki doesn't cover the answer, say so plainly without inventing facts.
 
-EXCEPTION — small talk and meta questions: if the user greets you or asks about you rather than about their wiki ("hello", "who are you", "what can you do"), answer briefly and naturally in one or two sentences — you are MindBase, the assistant that maintains and answers from their personal wiki. No citations, and do not summarize the wiki material unless they asked about it.`;
+EXCEPTION — small talk and meta questions: if the user greets you or asks about you rather than about their wiki ("hello", "who are you", "what can you do"), answer briefly and naturally in one or two sentences — you are MindBase, the assistant that maintains and answers from their personal wiki. No citations, and do not summarize the wiki material unless they asked about it.
+
+LAYERS: candidates marked [source] are the user's own notes and captured material; [wiki] pages are AI-written synthesis derived from them. When both cover a claim, cite the [source]. Do not let a [wiki] page be the only support for a factual claim when a [source] candidate covers it.`;
 
 async function loadQAInstructions(store: Store): Promise<string> {
   try {
@@ -80,13 +84,47 @@ interface CandidateSummary {
   one_liner: string;
 }
 
-async function loadCandidateSummaries(
+const SOURCE_BOOST = 1.2;
+
+/**
+ * Re-rank BM25 hits so the user's own material (type 'source') edges out
+ * AI-written pages of similar relevance. Looks at the top 2*limit hits,
+ * boosts sources, then stable-sorts by score and slices to limit. Pure.
+ */
+export function preferSources(hits: SearchResult[], limit: number): SearchResult[] {
+  return hits
+    .slice(0, limit * 2)
+    .map((h) => (h.type === 'source' ? { ...h, score: h.score * SOURCE_BOOST } : h))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+function layerOf(type: SearchResult['type']): CitedSource['layer'] {
+  return type === 'source' ? 'source' : 'wiki';
+}
+
+export async function loadCandidateSummaries(
   store: Store,
   paths: string[],
   excludeVisibility: string[] = ['pii'],
 ): Promise<CandidateSummary[]> {
   const out: CandidateSummary[] = [];
   for (const p of paths) {
+    if (!p.startsWith('wiki/')) {
+      // v2 layout (sources/contributors, sources/raw, sources/research,
+      // context.md): no meta.json sidecar — derive title/one_liner from the body.
+      try {
+        const body = await store.readText(p);
+        const title = body.match(/^#\s+(.+)$/m)?.[1]?.trim()
+          ?? (p.split('/').pop() ?? p).replace(/\.md$/, '');
+        const one_liner = body.split('\n')
+          .map((l) => l.trim())
+          .find((l) => l.length > 0 && !l.startsWith('#'))
+          ?.slice(0, 160) ?? '';
+        out.push({ path: p, title, one_liner });
+      } catch { /* skip unreadable */ }
+      continue;
+    }
     const slug = p.replace(/^wiki\/(?:concepts|notes|articles)\//, '').replace(/\.md$/, '');
     const metaP = conceptMetaPath(slug);
     try {
@@ -117,24 +155,27 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
 
   yield { kind: 'progress', phase: 'keyword_filter' };
   let candidates: CandidateSummary[];
+  // Layer per candidate path: source (user material) vs wiki (AI synthesis).
+  const layerByPath = new Map<string, CitedSource['layer']>();
   if (opts.forcedContextSlugs && opts.forcedContextSlugs.length > 0) {
     // Bypass retrieval — use the exact slugs the caller provides
     const paths = opts.forcedContextSlugs.map((s) => `wiki/notes/${s}.md`);
     candidates = await loadCandidateSummaries(store, paths);
   } else {
-    const hits = index.search(question).slice(0, maxCands);
+    const hits = preferSources(index.search(question), maxCands);
+    for (const h of hits) layerByPath.set(h.path, layerOf(h.type));
     candidates = await loadCandidateSummaries(store, hits.map((h) => h.path));
   }
 
   const numberedSources: CitedSource[] = candidates.map((c, i) => {
     const slug = c.path.replace(/^wiki\/(?:concepts|notes|articles)\//, '').replace(/\.md$/, '');
-    return { n: i + 1, slug, title: c.title, path: c.path, one_liner: c.one_liner };
+    return { n: i + 1, slug, title: c.title, path: c.path, one_liner: c.one_liner, layer: layerByPath.get(c.path) ?? 'wiki' };
   });
 
   yield { kind: 'sources', sources: numberedSources };
 
-  const shortContext = candidates.length
-    ? candidates.map((c, i) => `[${i + 1}] ${c.title} (slug: ${c.path.replace(/^wiki\/(?:concepts|notes|articles)\//, '').replace(/\.md$/, '')}) — ${c.one_liner}`).join('\n')
+  const shortContext = numberedSources.length
+    ? numberedSources.map((s) => `[${s.n}] [${s.layer}] ${s.title} (${s.path}) — ${s.one_liner}`).join('\n')
     : '(no candidates matched)';
 
   // --- Three-tier source loading ---
@@ -179,12 +220,12 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
   }
 
   // TIER 2: Load wiki notes + their raw sources (if we have budget left)
-  for (const cand of candidates.slice(0, 3)) {
+  for (const cand of numberedSources.slice(0, 3)) {
     if (usedChars >= MAX_SOURCE_CHARS) break;
     try {
       const noteBody = await store.readText(cand.path);
       const noteTruncated = noteBody.slice(0, Math.min(3000, MAX_SOURCE_CHARS - usedChars));
-      sourceBlocks.push(`--- Wiki Note: ${cand.title} ---\n${noteTruncated}`);
+      sourceBlocks.push(`--- [${cand.layer}] ${cand.title} ---\n${noteTruncated}`);
       usedChars += noteTruncated.length;
 
       // TIER 3: Load raw sources referenced by this wiki note

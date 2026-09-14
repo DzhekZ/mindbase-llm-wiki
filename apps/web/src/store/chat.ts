@@ -11,6 +11,8 @@ export interface CitedSource {
   title: string;
   path: string;
   one_liner: string;
+  /** 'source' = user's own material; 'wiki' = AI-written synthesis. Absent on older messages. */
+  layer?: 'source' | 'wiki';
 }
 
 export interface ChatMessage {

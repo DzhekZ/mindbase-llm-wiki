@@ -185,6 +185,17 @@ export function ChatMessage({
                   ) : (
                     <span style={{ color: 'var(--text-default)' }}>{c.title}</span>
                   )}{' '}
+                  {src?.layer && (
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        color: src.layer === 'source' ? 'var(--accent)' : 'var(--text-faint)',
+                      }}
+                      title={src.layer === 'source' ? 'Your own note / captured material' : 'AI-written synthesis'}
+                    >
+                      {src.layer}
+                    </span>
+                  )}{' '}
                   <span style={{ color: 'var(--text-low)' }}>· {c.path}</span>
                 </div>
               );

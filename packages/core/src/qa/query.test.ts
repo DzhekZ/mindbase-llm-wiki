@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MemoryStore } from '../storage/memory_store';
 import { SearchIndex } from '../search/index';
-import { askQuestion, type QAEvent, type CitedSource } from './query';
+import { askQuestion, preferSources, loadCandidateSummaries, type QAEvent, type CitedSource } from './query';
+import type { SearchResult } from '../search/index';
 import type { ChatChunk, ChatRequest, MetaJson } from '../types';
 import type { LLMAdapter } from '../adapters/types';
 
@@ -208,5 +209,126 @@ describe('askQuestion', () => {
     }
     const err = events.find((e) => e.kind === 'error') as { kind: 'error'; error: string } | undefined;
     expect(err?.error).toMatch(/rate limit/);
+  });
+
+  it('tags v2 source-layer hits as [source] and wiki pages as [wiki]', async () => {
+    await store.writeText(
+      'sources/contributors/alice/2026-09-01.md',
+      '# Alice daily 2026-09-01\n\nI decided RAG is not enough; we need a maintained wiki.\n',
+    );
+    await store.writeText(
+      'sources/research/rag-vs-wiki.md',
+      '# RAG vs Wiki\n\nAI synthesis comparing retrieval and compiled wikis.\n',
+    );
+    idx.add({ path: 'sources/contributors/alice/2026-09-01.md', title: 'Alice daily 2026-09-01', body: 'RAG retrieval wiki decided', type: 'source' });
+    idx.add({ path: 'sources/research/rag-vs-wiki.md', title: 'RAG vs Wiki', body: 'RAG retrieval wiki synthesis', type: 'concept' });
+
+    const adapter = fakeAdapter([
+      [
+        { kind: 'delta', text: 'RAG is retrieval [1].' },
+        { kind: 'done', usage: { input_tokens: 10, output_tokens: 5 } },
+      ],
+    ]);
+    const events: QAEvent[] = [];
+    for await (const e of askQuestion({
+      question: 'RAG retrieval wiki',
+      store,
+      index: idx,
+      adapter,
+      model: 'gpt-4o-mini',
+    })) {
+      events.push(e);
+    }
+
+    const sourcesEvent = events.find((e) => e.kind === 'sources') as { kind: 'sources'; sources: CitedSource[] };
+    const contributor = sourcesEvent.sources.find((s) => s.path === 'sources/contributors/alice/2026-09-01.md');
+    const research = sourcesEvent.sources.find((s) => s.path === 'sources/research/rag-vs-wiki.md');
+    const legacy = sourcesEvent.sources.find((s) => s.path === 'wiki/notes/rag.md');
+    expect(contributor?.layer).toBe('source');
+    expect(contributor?.title).toBe('Alice daily 2026-09-01');
+    expect(contributor?.one_liner).toBe('I decided RAG is not enough; we need a maintained wiki.');
+    expect(research?.layer).toBe('wiki');
+    expect(legacy?.layer).toBe('wiki');
+
+    // The prompt must carry the layer tag per candidate + the LAYERS instruction.
+    const prompt = String(adapter.calls[0]?.messages[0]?.content ?? '');
+    expect(prompt).toMatch(/\[\d+\] \[source\] Alice daily 2026-09-01 \(sources\/contributors\/alice\/2026-09-01\.md\)/);
+    expect(prompt).toMatch(/\[\d+\] \[wiki\] RAG vs Wiki \(sources\/research\/rag-vs-wiki\.md\)/);
+    expect(prompt).toContain('--- [source] Alice daily 2026-09-01 ---');
+    expect(prompt).toContain('LAYERS:');
+  });
+});
+
+describe('preferSources', () => {
+  const research: SearchResult = { path: 'sources/research/a.md', title: 'a', type: 'concept', score: 10 };
+  const contributor: SearchResult = { path: 'sources/contributors/u/n.md', title: 'n', type: 'source', score: 9 };
+
+  it('boosts source-layer hits by 1.2x so a close source outranks a wiki page', () => {
+    const out = preferSources([research, contributor], 2);
+    expect(out.map((h) => h.path)).toEqual(['sources/contributors/u/n.md', 'sources/research/a.md']);
+    expect(out[0]?.score).toBeCloseTo(10.8);
+    expect(out[1]?.score).toBe(10);
+  });
+
+  it('keeps a weak source behind a strong wiki page', () => {
+    const weak: SearchResult = { ...contributor, score: 5 };
+    const out = preferSources([research, weak], 2);
+    expect(out.map((h) => h.path)).toEqual(['sources/research/a.md', 'sources/contributors/u/n.md']);
+    expect(out[1]?.score).toBeCloseTo(6);
+  });
+
+  it('considers 2x limit candidates then slices to limit', () => {
+    const wiki = (i: number): SearchResult => ({ path: `sources/research/w${i}.md`, title: `w${i}`, type: 'concept', score: 10 - i * 0.1 });
+    // 4 wiki hits then a source at rank 5: with limit 2 the pool is the top 4, so
+    // the source is never considered; with limit 3 (pool 6) it is boosted to the top.
+    const hits = [wiki(0), wiki(1), wiki(2), wiki(3), { ...contributor, score: 9.5 }];
+    expect(preferSources(hits, 2).map((h) => h.path)).toEqual(['sources/research/w0.md', 'sources/research/w1.md']);
+    const out3 = preferSources(hits, 3);
+    expect(out3).toHaveLength(3);
+    expect(out3[0]?.path).toBe('sources/contributors/u/n.md');
+  });
+
+  it('does not mutate the input hits', () => {
+    const input = [{ ...contributor }];
+    preferSources(input, 1);
+    expect(input[0]?.score).toBe(9);
+  });
+});
+
+describe('loadCandidateSummaries', () => {
+  it('reads title from H1 and one_liner from first body line for non-wiki paths', async () => {
+    const store = new MemoryStore();
+    await store.writeText(
+      'sources/contributors/bob/notes/pricing.md',
+      '\n# Pricing thoughts\n\n## Context\n\n   We should charge per seat, not per project.   \nMore text.\n',
+    );
+    await store.writeText('sources/raw/2026-09-01/abc.extracted.md', 'no heading here\nsecond line');
+    const out = await loadCandidateSummaries(store, [
+      'sources/contributors/bob/notes/pricing.md',
+      'sources/raw/2026-09-01/abc.extracted.md',
+    ]);
+    expect(out).toEqual([
+      {
+        path: 'sources/contributors/bob/notes/pricing.md',
+        title: 'Pricing thoughts',
+        one_liner: 'We should charge per seat, not per project.',
+      },
+      { path: 'sources/raw/2026-09-01/abc.extracted.md', title: 'abc.extracted', one_liner: 'no heading here' },
+    ]);
+  });
+
+  it('truncates the one_liner to 160 chars', async () => {
+    const store = new MemoryStore();
+    await store.writeText('sources/contributors/bob/2026-09-02.md', `# D\n\n${'x'.repeat(300)}\n`);
+    const out = await loadCandidateSummaries(store, ['sources/contributors/bob/2026-09-02.md']);
+    expect(out[0]?.one_liner).toHaveLength(160);
+  });
+
+  it('keeps the wiki/ meta.json behavior', async () => {
+    const store = new MemoryStore();
+    await store.writeText('wiki/concepts/rag.md', '# Not this title\n\nbody');
+    await store.writeJSON('wiki/concepts/rag.meta.json', { title: 'RAG', one_liner: 'Retrieval augmented generation' });
+    const out = await loadCandidateSummaries(store, ['wiki/concepts/rag.md']);
+    expect(out).toEqual([{ path: 'wiki/concepts/rag.md', title: 'RAG', one_liner: 'Retrieval augmented generation' }]);
   });
 });

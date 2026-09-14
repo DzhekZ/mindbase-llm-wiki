@@ -361,6 +361,34 @@ export async function createContext(dataDir?: string): Promise<ServerContext> {
           searchIndex.add({ path: 'context.md', title: firstHeading(contextBody, 'Project Context'), body: contextBody, type: 'concept' });
         }
       } catch { /* no context.md yet */ }
+      // v2 source layer: contributor notes + extracted raw text. Without these
+      // /api/ask can only retrieve AI-written pages and the wiki cites itself.
+      // Indexed as type 'source' so query.ts can prefer them over synthesis.
+      const MAX_SOURCE_FILES = 400;
+      const sourceFiles: string[] = [];
+      const walk = async (dir: string, accept: (name: string) => boolean): Promise<void> => {
+        if (sourceFiles.length >= MAX_SOURCE_FILES) return;
+        let entries: Array<{ name: string; kind: 'file' | 'directory' }> = [];
+        try {
+          entries = await store.listDir(dir);
+        } catch { return; /* v1 project or dir absent */ }
+        for (const entry of entries) {
+          if (sourceFiles.length >= MAX_SOURCE_FILES) return;
+          const p = `${dir}/${entry.name}`;
+          if (entry.kind === 'directory') await walk(p, accept);
+          else if (accept(entry.name)) sourceFiles.push(p);
+        }
+      };
+      await walk('sources/contributors', (n) => n.endsWith('.md'));
+      await walk('sources/raw', (n) => n.endsWith('.extracted.md'));
+      for (const filePath of sourceFiles) {
+        try {
+          const body = await store.readText(filePath);
+          if (!body.trim()) continue;
+          const base = filePath.split('/').pop() ?? filePath;
+          searchIndex.add({ path: filePath, title: firstHeading(body, base.replace(/\.extracted\.md$|\.md$/, '')), body, type: 'source' });
+        } catch { /* skip unreadable */ }
+      }
       await ctx.persistIndex();
       // Rebuild WikiIndex pages + links from disk for THIS project. Other
       // projects' pages stay in the unified graph untouched.
