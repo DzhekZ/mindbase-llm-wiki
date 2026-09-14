@@ -30,6 +30,7 @@ import type { MilkdownPlugin } from '@milkdown/kit/ctx';
 
 import type { EditorMode } from './EditorToolbar';
 import { wikilinkPlugins, makeWikilinkInteractionPlugin } from './plugins/wikilink';
+import { citationPlugins } from './plugins/citation';
 import { calloutPlugin } from './plugins/callout';
 import { makeImageUploader } from './plugins/image-paste';
 import { WikilinkPopover } from '../WikilinkPopover';
@@ -177,6 +178,7 @@ function MilkdownInner({
         .use(upload)
         .use(wikilinkPlugins as MilkdownPlugin[])
         .use(wikilinkInteraction as MilkdownPlugin)
+        .use(citationPlugins as MilkdownPlugin[])
         .use(calloutPlugin as MilkdownPlugin);
 
       void editor.create().then((e) => {

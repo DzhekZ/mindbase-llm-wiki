@@ -487,6 +487,23 @@ a.wikilink-chip:hover {
   text-decoration: none;
 }
 
+/* [@path] source citations — amber so they read as "evidence", not navigation */
+a.citation-chip {
+  color: var(--accent-amber, #d97706);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.85em;
+  text-decoration: none;
+  cursor: pointer;
+  display: inline;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(217, 119, 6, 0.08);
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+a.citation-chip:hover {
+  background: rgba(217, 119, 6, 0.18);
+}
+
 /* Callout blocks (Milkdown plugin) */
 .ProseMirror .callout > p { margin: 0; }
 

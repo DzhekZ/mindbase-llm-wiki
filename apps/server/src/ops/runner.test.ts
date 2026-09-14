@@ -202,6 +202,22 @@ describe('contribute: source layer + duplicate guard', () => {
     await applyContributePlan(plan.planId, [], cApply.emit);
     expect(cApply.events.some((e) => e.kind === 'error' && /No actions selected/.test(e.error))).toBe(true);
   });
+
+  it('(e) pages the model forgot to cite get the source citation added deterministically', async () => {
+    const src = 'sources/contributors/u/notes/thing.md';
+    const uncited = JSON.stringify({ takeaways: ['t'], plan: [
+      { kind: 'create_research_page', slug: 'thing', markdown: '# Thing\n\nBody.' },
+      { kind: 'append_context_section', section: 'Learnings', markdown: '- learned a thing' },
+      { kind: 'create_research_page', slug: 'cited', markdown: `# Cited\n\nSee [@${src}].` },
+    ] });
+    const c = collect();
+    await runContributePlan(scriptedCtx([uncited]), 'x', c.emit, { sourcePath: src });
+    const plan = planOf(c.events).plan;
+    expect(plan[0]).toMatchObject({ kind: 'create_research_page', markdown: `# Thing\n\nBody.\n\nSources: [@${src}]\n` });
+    expect(plan[1]).toMatchObject({ kind: 'append_context_section', markdown: `- learned a thing [@${src}]` });
+    // Already-cited pages are left untouched.
+    expect(plan[2]).toMatchObject({ markdown: `# Cited\n\nSee [@${src}].` });
+  });
 });
 
 describe('build', () => {

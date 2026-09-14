@@ -7,6 +7,7 @@
 import { useEffect, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { apiGet } from '../lib/api';
+import { dispatchCitationClick, linkifyCitations } from '../lib/citations';
 import { OpRun } from './ops/OpRun';
 
 interface ContextResponse {
@@ -104,7 +105,26 @@ export function WikiHome() {
                 lineHeight: 1.65,
               } as React.CSSProperties}
             >
-              <ReactMarkdown>{contextBody}</ReactMarkdown>
+              <ReactMarkdown
+                components={{
+                  a: ({ href, children, ...rest }) => {
+                    const cite = href?.startsWith('#cite:') ? href.slice('#cite:'.length) : null;
+                    if (cite === null) return <a href={href} {...rest}>{children}</a>;
+                    return (
+                      <a
+                        href={href}
+                        className="citation-chip"
+                        title={`Source: ${cite}`}
+                        onClick={(e) => { e.preventDefault(); dispatchCitationClick(cite, e.metaKey || e.ctrlKey); }}
+                      >
+                        {children}
+                      </a>
+                    );
+                  },
+                }}
+              >
+                {linkifyCitations(contextBody)}
+              </ReactMarkdown>
             </div>
           )}
         </div>

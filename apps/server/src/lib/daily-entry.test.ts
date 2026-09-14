@@ -33,4 +33,13 @@ describe('appendDailyEntry', () => {
     expect(lines[0]).toMatch(new RegExp(`^## \\[${today()} \\d{2}:\\d{2}\\] contribute \\| user=alice bytes=${'  first thought  '.length}$`));
     expect(lines[1]).toMatch(/contribute \| user=alice bytes=14$/);
   });
+
+  it('re-submitting the last entry verbatim is a no-op (no duplicate, no extra log line)', async () => {
+    const { file } = await appendDailyEntry(root, 'alice', 'same thought');
+    await appendDailyEntry(root, 'alice', '  same thought \n');
+    const body = await readFile(join(root, file), 'utf-8');
+    expect(body.match(/same thought/g)).toHaveLength(1);
+    const log = await readFile(join(root, 'logs', `${today()}.md`), 'utf-8');
+    expect(log.trim().split('\n')).toHaveLength(1);
+  });
 });

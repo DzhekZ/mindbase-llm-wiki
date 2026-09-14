@@ -138,6 +138,26 @@ function guardDuplicatePages(
   return { actions: kept, notes, reserve };
 }
 
+/**
+ * Deterministic citation guarantee: every page this plan writes from the
+ * entry points back at the source file, whether or not the model followed
+ * the CITATIONS rule. Research pages get a trailing `Sources:` line;
+ * appended context bullets get the tag inline at the end. Without this a
+ * fresh contribution is flagged `uncited_source` by the very next lint.
+ */
+export function ensureCitations(actions: Action[], sourcePath: string): Action[] {
+  const tag = `[@${sourcePath}]`;
+  return actions.map((a) => {
+    if (a.kind === 'create_research_page' && !a.markdown.includes(tag)) {
+      return { ...a, markdown: `${a.markdown.trimEnd()}\n\nSources: ${tag}\n` };
+    }
+    if (a.kind === 'append_context_section' && !a.markdown.includes(tag)) {
+      return { ...a, markdown: `${a.markdown.trimEnd()} ${tag}` };
+    }
+    return a;
+  });
+}
+
 // --- per-project build locks ---
 const buildLocks = new Set<string>();
 
@@ -186,12 +206,13 @@ export async function runContributePlan(
     // world may have moved while the model was thinking.
     prunePlans();
     const guarded = guardDuplicatePages(out.plan, await listResearchSlugs(ctx.projectRoot), reservationsFor(ctx.projectId));
+    const actions = ensureCitations(guarded.actions, sourcePath);
     const planId = randomUUID();
     const expiresAt = Date.now() + PLAN_TTL_MS;
     const reservations = reservationsFor(ctx.projectId);
     for (const slug of guarded.reserve) reservations.set(slug, expiresAt);
     pendingPlans.set(planId, {
-      actions: guarded.actions,
+      actions,
       projectRoot: ctx.projectRoot,
       projectId: ctx.projectId,
       expiresAt,
@@ -201,7 +222,7 @@ export async function runContributePlan(
       kind: 'plan',
       planId,
       takeaways: out.takeaways,
-      plan: guarded.actions,
+      plan: actions,
       ...(guarded.notes.length ? { notes: guarded.notes } : {}),
     });
     emit({ kind: 'done' });

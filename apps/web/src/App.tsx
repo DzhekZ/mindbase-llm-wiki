@@ -13,6 +13,7 @@ import { IndexingToast } from './components/IndexingToast';
 import { AddEntryModal } from './components/AddEntryModal';
 import { ToastHost } from './components/Toast';
 import { showToast } from './store/toast';
+import { CITATION_CLICK_EVENT } from './lib/citations';
 
 // Phase E wiki v2: known tree categories that MAY appear as the first arg of
 // onOpenArticle / onOpenNote. Anything not in this set is treated as a legacy
@@ -223,6 +224,24 @@ export default function App() {
     }
     document.addEventListener('milkdown:wikilink-click', handler as EventListener);
     return () => document.removeEventListener('milkdown:wikilink-click', handler as EventListener);
+  }, [navigate]);
+
+  // [@path] source citations carry a full project-relative path, so they
+  // route precisely (contributor note, daily file, raw import) — no
+  // category guessing like wikilinks.
+  useEffect(() => {
+    function handler(e: Event) {
+      const detail = (e as CustomEvent<{ path?: string; newTab?: boolean }>).detail;
+      const path = detail?.path?.trim();
+      if (!path) return;
+      const r = normalizeArticleRoute(path, path);
+      const route: import('./store/canvas-route').CanvasRoute & { _newTab?: boolean } =
+        { kind: 'note', slug: r.slug, path: r.path, category: r.category, autofocus: false };
+      if (detail?.newTab) route._newTab = true;
+      navigate(route);
+    }
+    document.addEventListener(CITATION_CLICK_EVENT, handler as EventListener);
+    return () => document.removeEventListener(CITATION_CLICK_EVENT, handler as EventListener);
   }, [navigate]);
 
   function syncDrive() {

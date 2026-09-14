@@ -7,7 +7,7 @@
 //
 // Deliberately uses node:fs directly against the absolute project root (no
 // core `projectPaths` dependency) so it stays trivially portable.
-import { appendFile, mkdir, stat } from 'node:fs/promises';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 export async function appendDailyEntry(projectRoot: string, user: string, text: string): Promise<{ file: string }> {
@@ -17,9 +17,13 @@ export async function appendDailyEntry(projectRoot: string, user: string, text: 
   const file = `sources/contributors/${user}/${today}.md`;
   const absFile = join(projectRoot, file);
   await mkdir(dirname(absFile), { recursive: true });
-  const exists = await stat(absFile).then(() => true).catch(() => false);
-  const header = exists ? '' : `# ${today} — ${user}\n`;
-  await appendFile(absFile, `${header}\n## ${hhmm}\n\n${text.trim()}\n`, 'utf-8');
+  const body = text.trim();
+  const current = await readFile(absFile, 'utf-8').catch(() => null);
+  // Re-submitting the last entry (retry after an LLM error, double click)
+  // must not duplicate it — the source layer is append-only, not undoable.
+  if (current !== null && current.trimEnd().endsWith(body)) return { file };
+  const header = current === null ? `# ${today} — ${user}\n` : '';
+  await appendFile(absFile, `${header}\n## ${hhmm}\n\n${body}\n`, 'utf-8');
 
   const logFile = join(projectRoot, 'logs', `${today}.md`);
   await mkdir(dirname(logFile), { recursive: true });
