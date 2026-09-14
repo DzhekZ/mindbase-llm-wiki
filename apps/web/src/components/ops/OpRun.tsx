@@ -12,6 +12,12 @@ interface OpRunProps {
   op: OpName;
   /** Initial argument for contribute; empty string opens the inline input. */
   initialText?: string;
+  /**
+   * Contribute only: project-relative path of the file `initialText` already
+   * lives in (an open note). When unset the server appends the text to the
+   * user's daily contributor file first, so every contribution has a source.
+   */
+  sourcePath?: string;
   onOpenArticle: (slug: string, path: string) => void;
   onClose: () => void;
   /** Fires once when the op finishes applying (files were written). */
@@ -23,11 +29,12 @@ interface PlanState {
   takeaways: string[];
   plan: OpAction[];
   checked: boolean[];
+  notes: string[];
 }
 
 type Stage = 'input' | 'running' | 'awaiting-approval' | 'applying' | 'done' | 'error';
 
-export function OpRun({ op, initialText = '', onOpenArticle, onClose, onDone }: OpRunProps) {
+export function OpRun({ op, initialText = '', sourcePath, onOpenArticle, onClose, onDone }: OpRunProps) {
   const provider = useSettings((s) => s.provider);
   const model = useSettings((s) => s.model);
   const takesArg = op === 'contribute' || op === 'research';
@@ -47,7 +54,7 @@ export function OpRun({ op, initialText = '', onOpenArticle, onClose, onDone }: 
   const handleEvent = useCallback((ev: OpEvent) => {
     if (ev.kind === 'phase') setPhase(ev.phase);
     else if (ev.kind === 'plan') {
-      setPlan({ planId: ev.planId, takeaways: ev.takeaways, plan: ev.plan, checked: ev.plan.map(() => true) });
+      setPlan({ planId: ev.planId, takeaways: ev.takeaways, plan: ev.plan, checked: ev.plan.map(() => true), notes: ev.notes ?? [] });
       setStage('awaiting-approval');
     } else if (ev.kind === 'applied') {
       setApplied(ev.applied);
@@ -72,13 +79,13 @@ export function OpRun({ op, initialText = '', onOpenArticle, onClose, onDone }: 
     setPhase('starting');
     setError('');
     const body = op === 'contribute'
-      ? { mode: 'plan', text: argText }
+      ? { mode: 'plan', text: argText, ...(sourcePath ? { sourcePath } : {}) }
       : op === 'research'
         ? { topic: argText }
         : {};
     const path = `/ops/${op}`;
     cancelRef.current = apiSSE<OpEvent>(path, body, handleEvent).cancel;
-  }, [op, handleEvent]);
+  }, [op, sourcePath, handleEvent]);
 
   // Auto-start when we arrived with an argument (or the op takes none).
   const autoStarted = useRef(false);
@@ -186,11 +193,23 @@ export function OpRun({ op, initialText = '', onOpenArticle, onClose, onDone }: 
                 {plan.takeaways.map((t, i) => <li key={i} className="flex gap-1.5"><span style={{ color: 'var(--accent)' }}>•</span><span>{t}</span></li>)}
               </ul>
             </div>
+            {plan.notes.length > 0 && (
+              <div className="flex flex-col gap-0.5">
+                {plan.notes.map((n, i) => (
+                  <div key={i} style={{ fontSize: 11.5, color: 'var(--text-mid)', lineHeight: '16px' }} data-testid="op-plan-note">
+                    ⓘ {n}
+                  </div>
+                ))}
+              </div>
+            )}
             <div>
               <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
                 Proposed updates
               </div>
               <div className="mt-1 flex flex-col gap-1">
+                {plan.plan.length === 0 && (
+                  <div style={{ fontSize: 12, color: 'var(--text-faint)' }}>Nothing left to apply.</div>
+                )}
                 {plan.plan.map((a, i) => (
                   <label
                     key={i}
@@ -222,9 +241,11 @@ export function OpRun({ op, initialText = '', onOpenArticle, onClose, onDone }: 
               >
                 Cancel
               </button>
-              <PrimaryBtn disabled={selectedCount === 0} onClick={apply} testId="op-apply">
-                Apply ({selectedCount})
-              </PrimaryBtn>
+              {plan.plan.length > 0 && (
+                <PrimaryBtn disabled={selectedCount === 0} onClick={apply} testId="op-apply">
+                  Apply ({selectedCount})
+                </PrimaryBtn>
+              )}
             </div>
           </div>
         )}

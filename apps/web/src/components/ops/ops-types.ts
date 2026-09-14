@@ -29,7 +29,14 @@ export interface Finding {
 
 export type OpEvent =
   | { kind: 'phase'; phase: string }
-  | { kind: 'plan'; planId: string; takeaways: string[]; plan: OpAction[] }
+  | {
+    kind: 'plan';
+    planId: string;
+    takeaways: string[];
+    plan: OpAction[];
+    /** Reasons the server dropped proposed actions (e.g. duplicate pages). Present only when non-empty. */
+    notes?: string[];
+  }
   | { kind: 'applied'; applied: string[]; failed: Array<{ action: string; error: string }>; note?: string }
   | { kind: 'findings'; date: string; findings: Finding[] }
   | { kind: 'done' }

@@ -45,6 +45,24 @@ interface Props {
   autofocus?: boolean;
 }
 
+/**
+ * Project-relative path of a tree-API (category, path) pair — the form ops
+ * cite sources in (`[@sources/contributors/u/notes/x.md]`). Null for
+ * categories that are not files on disk.
+ */
+function projectRelativePath(category: string, path: string): string | null {
+  switch (category) {
+    case 'contributors': return `sources/contributors/${path}`;
+    case 'research': return `sources/research/${path}`;
+    case 'raw': return `sources/raw/${path}`;
+    case 'logs': return `logs/${path}`;
+    case 'artifacts': return `artifacts/${path}`;
+    case 'context': return 'context.md';
+    case 'readme': return 'README.md';
+    default: return null;
+  }
+}
+
 /** Derive a graph-index slug (basename without .md) from a tree path. */
 function slugFromPath(path: string): string {
   const base = path.split('/').pop() ?? path;
@@ -505,6 +523,7 @@ export function NotePane({ category, path, onClose, onWikiChanged, onOpenArticle
                 key={processText}
                 op="contribute"
                 initialText={processText.trim()}
+                sourcePath={projectRelativePath(category, path) ?? undefined}
                 onOpenArticle={(s, p) => onOpenArticle?.(s, p)}
                 onClose={() => setProcessText(null)}
                 onDone={(applied) => {

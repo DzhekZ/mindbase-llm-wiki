@@ -29,14 +29,39 @@ Action is EXACTLY one of:
 Rules: prefer appending to context sections over full rewrites; create at
 most ONE new research page and only when the entry introduces a genuinely
 new concept; link related pages with add_wikilinks; never invent other
-action kinds; keep markdown concise.`;
+action kinds; keep markdown concise.
+CITATIONS: when you create or update a research page, cite the underlying source files with [@<project-relative-path>], e.g. [@sources/contributors/haobing/2026-08-19.md]. Use only paths that appear in this prompt. Every research page must cite at least one source.
+STATE RULE: document the shape of a thing, never a live value that moves on its own (commit SHAs, line counts, "last synced" dates, counters). Write a pointer to where the live value lives instead. Values that do not move — paths, hostnames, names, dated historical facts — are written in full.`;
 
-export function contributePrompt(input: { text: string; core: ProjectCore; related: RelatedPage[] }): { system: string; user: string } {
+const MAX_EXISTING_SLUGS = 60;
+
+const listOrNone = (items: string[]): string => (items.length ? items.join(', ') : '(none)');
+
+export function contributePrompt(input: {
+  text: string;
+  core: ProjectCore;
+  related: RelatedPage[];
+  /** Project-relative path of the source file the entry lives in. */
+  sourcePath: string;
+  /** Slugs of research pages already on disk. */
+  existingSlugs: string[];
+  /** Slugs other pending plans are about to create. */
+  pendingSlugs: string[];
+}): { system: string; user: string } {
   const related = input.related.length
     ? input.related.map((r) => `--- ${r.path}\n${r.excerpt}`).join('\n')
     : '(none found)';
   return {
     system: SYSTEM,
-    user: `NEW ENTRY from the user:\n${input.text}\n\nCURRENT context.md:\n${input.core.context || '(empty)'}\n\nPROJECT RULES (README.md):\n${input.core.readme || '(none)'}\n\nRELATED EXISTING PAGES:\n${related}\n\nProduce takeaways + the minimal update plan as JSON.`,
+    user: [
+      `NEW ENTRY from the user:\n${input.text}`,
+      `SOURCE PATH (cite this in any research page you create or update, verbatim as [@${input.sourcePath}]): ${input.sourcePath}`,
+      `CURRENT context.md:\n${input.core.context || '(empty)'}`,
+      `PROJECT RULES (README.md):\n${input.core.readme || '(none)'}`,
+      `RELATED EXISTING PAGES:\n${related}`,
+      `EXISTING RESEARCH PAGES (slugs — never create a duplicate; update/append or add_wikilinks instead):\n${listOrNone(input.existingSlugs.slice(0, MAX_EXISTING_SLUGS))}`,
+      `PENDING PAGES (being created by other plans right now — do not create these):\n${listOrNone(input.pendingSlugs)}`,
+      'Produce takeaways + the minimal update plan as JSON.',
+    ].join('\n\n'),
   };
 }

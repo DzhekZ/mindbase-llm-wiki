@@ -87,6 +87,15 @@ export async function gatherResearchPages(root: string): Promise<ResearchPage[]>
   return pages;
 }
 
+/**
+ * Slugs of every `sources/research/*.md` page — a cheap directory listing
+ * (no bodies) for duplicate-page guards and prompt hints.
+ */
+export async function listResearchSlugs(root: string): Promise<string[]> {
+  const entries = await readdir(join(root, 'sources', 'research'), { withFileTypes: true }).catch(() => []);
+  return entries.filter((e) => e.isFile() && e.name.endsWith('.md')).map((e) => e.name.replace(/\.md$/, ''));
+}
+
 export interface SourceStat {
   path: string;
   /** Citations from research pages + context.md pointing at this source. */

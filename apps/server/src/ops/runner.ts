@@ -9,9 +9,10 @@ import { randomUUID } from 'node:crypto';
 import { applyActions } from './executors';
 import { completeJson, OpLlmError, type LlmCtx } from './llm';
 import {
-  gatherProjectCore, gatherResearchPages, gatherSourceStats, gatherUnbuiltSources,
+  gatherProjectCore, gatherResearchPages, gatherSourceStats, gatherUnbuiltSources, listResearchSlugs,
   type ResearchPage, type SourceStat,
 } from './gather';
+import { appendDailyEntry } from '../lib/daily-entry';
 import { contributePrompt, contributePlanSchema, type RelatedPage } from './recipes/contribute';
 import { buildPrompt, buildSchema } from './recipes/build';
 import { lintPrompt, lintSchema, type Finding } from './recipes/lint';
@@ -34,7 +35,14 @@ export interface StoredFinding extends Omit<Finding, 'evidence'> {
 
 export type OpEvent =
   | { kind: 'phase'; phase: string }
-  | { kind: 'plan'; planId: string; takeaways: string[]; plan: Action[] }
+  | {
+    kind: 'plan';
+    planId: string;
+    takeaways: string[];
+    plan: Action[];
+    /** Human-readable reasons for actions the guard removed. Present only when non-empty. */
+    notes?: string[];
+  }
   | { kind: 'applied'; applied: string[]; failed: Array<{ action: string; error: string }>; note?: string }
   | { kind: 'findings'; date: string; findings: StoredFinding[] }
   | { kind: 'done' }
@@ -43,6 +51,8 @@ export type OpEvent =
 export interface OpsCtx extends LlmCtx {
   projectRoot: string;
   projectId: string;
+  /** Attributed author — owns `sources/contributors/<user>/`. */
+  user: string;
   /** Hybrid search over the wiki; empty array on failure is acceptable. */
   findRelated?: (text: string, k: number) => Promise<RelatedPage[]>;
   /** Optional Brave Search key — enables web mode for the research op. */
@@ -50,13 +60,82 @@ export interface OpsCtx extends LlmCtx {
 }
 
 // --- pending contribute plans (checkpoint state) ---
-interface PendingPlan { actions: Action[]; projectRoot: string; projectId: string; expiresAt: number }
+interface PendingPlan {
+  actions: Action[];
+  projectRoot: string;
+  projectId: string;
+  expiresAt: number;
+  /** Normalized research slugs this plan will create; held until the plan is consumed or expires. */
+  reserved: string[];
+}
 const pendingPlans = new Map<string, PendingPlan>();
 const PLAN_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Slugs that pending (not yet applied) plans intend to create, per project,
+ * so two concurrent contributes cannot both propose the same new page.
+ * projectId → normalized slug → expiresAt.
+ */
+const reservedSlugs = new Map<string, Map<string, number>>();
+
+/** Case/separator-insensitive slug identity: `Deep_Work` ≡ `deep--work` ≡ `deep-work`. */
+export const normalizeSlug = (s: string): string => s.toLowerCase().replace(/[-_\s]+/g, '-').replace(/^-+|-+$/g, '');
+
+function reservationsFor(projectId: string): Map<string, number> {
+  let m = reservedSlugs.get(projectId);
+  if (!m) {
+    m = new Map();
+    reservedSlugs.set(projectId, m);
+  }
+  return m;
+}
+
+function releaseReservations(projectId: string, slugs: string[]): void {
+  const m = reservedSlugs.get(projectId);
+  if (!m) return;
+  for (const s of slugs) m.delete(s);
+  if (m.size === 0) reservedSlugs.delete(projectId);
+}
 
 function prunePlans(): void {
   const now = Date.now();
   for (const [id, p] of pendingPlans) if (p.expiresAt < now) pendingPlans.delete(id);
+  for (const [projectId, m] of reservedSlugs) {
+    for (const [slug, expiresAt] of m) if (expiresAt < now) m.delete(slug);
+    if (m.size === 0) reservedSlugs.delete(projectId);
+  }
+}
+
+/**
+ * Drop `create_research_page` actions whose slug collides (after
+ * normalization) with a page already on disk or one another pending plan
+ * is about to create. Returns the surviving actions, a note per removal,
+ * and the normalized slugs the surviving creates should reserve.
+ */
+function guardDuplicatePages(
+  actions: Action[],
+  existingSlugs: string[],
+  pending: Map<string, number>,
+): { actions: Action[]; notes: string[]; reserve: string[] } {
+  const existing = new Map(existingSlugs.map((s) => [normalizeSlug(s), s]));
+  const notes: string[] = [];
+  const reserve: string[] = [];
+  const kept = actions.filter((a) => {
+    if (a.kind !== 'create_research_page') return true;
+    const key = normalizeSlug(a.slug);
+    const onDisk = existing.get(key);
+    if (onDisk !== undefined) {
+      notes.push(`Skipped creating "${a.slug}" — a page for this already exists (sources/research/${onDisk}.md). Update it instead.`);
+      return false;
+    }
+    if (pending.has(key)) {
+      notes.push(`Skipped creating "${a.slug}" — another pending plan is already creating it.`);
+      return false;
+    }
+    reserve.push(key);
+    return true;
+  });
+  return { actions: kept, notes, reserve };
 }
 
 // --- per-project build locks ---
@@ -75,25 +154,56 @@ function errText(e: unknown): string {
   return (e as Error).message;
 }
 
-export async function runContributePlan(ctx: OpsCtx, text: string, emit: (e: OpEvent) => void): Promise<void> {
+/**
+ * Plan a contribution. Free text (no `sourcePath`) is first appended to the
+ * user's daily contributor file so it exists as a citable source before the
+ * wiki is touched; an existing project-relative `sourcePath` (an open note,
+ * a raw import) is cited as-is.
+ */
+export async function runContributePlan(
+  ctx: OpsCtx,
+  text: string,
+  emit: (e: OpEvent) => void,
+  opts: { sourcePath?: string } = {},
+): Promise<void> {
   try {
+    let sourcePath = opts.sourcePath;
+    if (!sourcePath) {
+      emit({ kind: 'phase', phase: "saving to today's log" });
+      sourcePath = (await appendDailyEntry(ctx.projectRoot, ctx.user, text)).file;
+    }
     emit({ kind: 'phase', phase: 'reading project' });
-    const core = await gatherProjectCore(ctx.projectRoot);
+    const [core, existingSlugs] = await Promise.all([gatherProjectCore(ctx.projectRoot), listResearchSlugs(ctx.projectRoot)]);
     emit({ kind: 'phase', phase: 'finding related pages' });
     const related = (await ctx.findRelated?.(text, 5).catch(() => [])) ?? [];
     emit({ kind: 'phase', phase: `asking ${ctx.config.model}` });
-    const { system, user } = contributePrompt({ text, core, related });
+    prunePlans();
+    const pendingSlugs = [...reservationsFor(ctx.projectId).keys()];
+    const { system, user } = contributePrompt({ text, core, related, sourcePath, existingSlugs, pendingSlugs });
     const out = await completeJson(ctx, { system, user, schema: contributePlanSchema });
 
+    // Re-check against disk + reservations AFTER the (slow) completion: the
+    // world may have moved while the model was thinking.
     prunePlans();
+    const guarded = guardDuplicatePages(out.plan, await listResearchSlugs(ctx.projectRoot), reservationsFor(ctx.projectId));
     const planId = randomUUID();
+    const expiresAt = Date.now() + PLAN_TTL_MS;
+    const reservations = reservationsFor(ctx.projectId);
+    for (const slug of guarded.reserve) reservations.set(slug, expiresAt);
     pendingPlans.set(planId, {
-      actions: out.plan,
+      actions: guarded.actions,
       projectRoot: ctx.projectRoot,
       projectId: ctx.projectId,
-      expiresAt: Date.now() + PLAN_TTL_MS,
+      expiresAt,
+      reserved: guarded.reserve,
     });
-    emit({ kind: 'plan', planId, takeaways: out.takeaways, plan: out.plan });
+    emit({
+      kind: 'plan',
+      planId,
+      takeaways: out.takeaways,
+      plan: guarded.actions,
+      ...(guarded.notes.length ? { notes: guarded.notes } : {}),
+    });
     emit({ kind: 'done' });
   } catch (e) {
     emit({ kind: 'error', error: errText(e) });
@@ -108,7 +218,10 @@ export async function applyContributePlan(planId: string, selected: number[], em
       emit({ kind: 'error', error: 'This plan expired (plans are held for 10 minutes). Run the contribute again.' });
       return;
     }
+    // The plan is consumed either way, so its reservations are released
+    // even if the user deselected the page it reserved.
     pendingPlans.delete(planId);
+    releaseReservations(pending.projectId, pending.reserved);
     const actions = pending.actions.filter((_, i) => selected.includes(i));
     if (actions.length === 0) {
       emit({ kind: 'error', error: 'No actions selected.' });

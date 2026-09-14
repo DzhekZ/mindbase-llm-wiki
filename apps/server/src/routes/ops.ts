@@ -2,7 +2,7 @@
 //
 // SSE endpoints for server-side operations (UI parity with the plugin).
 import { Router } from 'express';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import type { ServerContext } from '../context';
 import { projectRoot as makeProjectRoot, detectLayoutVersion } from '../context';
 import {
@@ -11,6 +11,7 @@ import {
   type OpEvent, type OpsCtx,
 } from '../ops/runner';
 import { makeHybridSearchClosure } from '../lib/compile-deps';
+import { resolveUser } from '../lib/user-attribution';
 
 function sse(ctx: ServerContext, res: Response): (e: OpEvent) => void {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -30,7 +31,7 @@ function unconfigured(ctx: ServerContext): boolean {
   return !ctx.config.model || (!ctx.config.apiKey && !ctx.config.baseUrl && ctx.config.provider !== 'ollama');
 }
 
-async function opsCtx(ctx: ServerContext): Promise<OpsCtx | { error: string }> {
+async function opsCtx(ctx: ServerContext, req: Request): Promise<OpsCtx | { error: string }> {
   if (unconfigured(ctx)) {
     return { error: 'Configure an LLM in Settings first (or pick the free local model).' };
   }
@@ -42,6 +43,7 @@ async function opsCtx(ctx: ServerContext): Promise<OpsCtx | { error: string }> {
   return {
     projectId,
     projectRoot: root,
+    user: resolveUser(req),
     getAdapter: ctx.getAdapter,
     config: { model: ctx.config.model },
     braveApiKey: ctx.config.braveApiKey || undefined,
@@ -56,7 +58,9 @@ export function opsRoutes(ctx: ServerContext): Router {
   const router = Router();
 
   // POST /api/ops/contribute
-  //   { mode: 'plan', text }                      → phases + plan event
+  //   { mode: 'plan', text, sourcePath? }         → phases + plan event
+  //     sourcePath: project-relative file the text already lives in (an
+  //     open note); omitted → text is appended to today's daily file first.
   //   { mode: 'apply', planId, selected: number[] } → applied + done
   router.post('/contribute', async (req, res) => {
     const emit = sse(ctx, res);
@@ -73,19 +77,21 @@ export function opsRoutes(ctx: ServerContext): Router {
       emit({ kind: 'error', error: 'text required' });
       return res.end();
     }
-    const oc = await opsCtx(ctx);
+    const rawSource = req.body?.sourcePath;
+    const sourcePath = typeof rawSource === 'string' && rawSource.trim() ? rawSource.trim() : undefined;
+    const oc = await opsCtx(ctx, req);
     if ('error' in oc) {
       emit({ kind: 'error', error: oc.error });
       return res.end();
     }
-    await runContributePlan(oc, text, emit);
+    await runContributePlan(oc, text, emit, { sourcePath });
     return res.end();
   });
 
   // POST /api/ops/build {}
-  router.post('/build', async (_req, res) => {
+  router.post('/build', async (req, res) => {
     const emit = sse(ctx, res);
-    const oc = await opsCtx(ctx);
+    const oc = await opsCtx(ctx, req);
     if ('error' in oc) {
       emit({ kind: 'error', error: oc.error });
       return res.end();
@@ -102,7 +108,7 @@ export function opsRoutes(ctx: ServerContext): Router {
       emit({ kind: 'error', error: 'topic required' });
       return res.end();
     }
-    const oc = await opsCtx(ctx);
+    const oc = await opsCtx(ctx, req);
     if ('error' in oc) {
       emit({ kind: 'error', error: oc.error });
       return res.end();
@@ -112,9 +118,9 @@ export function opsRoutes(ctx: ServerContext): Router {
   });
 
   // POST /api/ops/lint {} — SSE; emits findings + caches them
-  router.post('/lint', async (_req, res) => {
+  router.post('/lint', async (req, res) => {
     const emit = sse(ctx, res);
-    const oc = await opsCtx(ctx);
+    const oc = await opsCtx(ctx, req);
     if ('error' in oc) {
       emit({ kind: 'error', error: oc.error });
       return res.end();

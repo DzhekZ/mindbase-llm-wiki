@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { gatherProjectCore, gatherUnbuiltSources, gatherResearchPages, gatherSourceStats, parseCitations } from './gather';
+import { gatherProjectCore, gatherUnbuiltSources, gatherResearchPages, gatherSourceStats, listResearchSlugs, parseCitations } from './gather';
 import { completeJson } from './llm';
 import type { ChatChunk, ChatMessage } from '@mindbase/core';
 
@@ -73,6 +73,17 @@ describe('gatherResearchPages', () => {
     expect(a.outbound).toEqual(['b']);
     expect(b.cites).toEqual([]);
     expect(b.inboundCount).toBe(1);
+  });
+});
+
+describe('listResearchSlugs', () => {
+  it('returns slugs of *.md files only, and [] when the dir is missing', async () => {
+    expect(await listResearchSlugs(root)).toEqual([]);
+    await touch('sources/research/deep-work.md', '# DW', 1000);
+    await touch('sources/research/b.md', '# B', 1000);
+    await touch('sources/research/notes.txt', 'nope', 1000);
+    await mkdir(join(root, 'sources', 'research', 'subdir'), { recursive: true });
+    expect((await listResearchSlugs(root)).sort()).toEqual(['b', 'deep-work']);
   });
 });
 

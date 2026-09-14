@@ -20,13 +20,19 @@ import { showToast } from './store/toast';
 // mapped to `research` per Phase E fallback contract.
 const TREE_CATEGORIES = new Set(['readme', 'context', 'soul', 'contributors', 'research', 'raw', 'logs', 'artifacts']);
 
+const slugOf = (path: string): string => (path.split('/').pop() ?? path).replace(/\.md$/i, '');
+
 function normalizeArticleRoute(categoryOrSlug: string, path: string): { category: string; slug: string; path: string } {
   if (TREE_CATEGORIES.has(categoryOrSlug)) {
     // Fresh Phase E call from CategoryTreeRoot / LeftRail.
-    const base = path.split('/').pop() ?? path;
-    const slug = base.replace(/\.md$/i, '');
-    return { category: categoryOrSlug, slug, path };
+    return { category: categoryOrSlug, slug: slugOf(path), path };
   }
+  // Project-relative paths from ops / [@path] citations
+  // (`sources/contributors/u/notes/x.md`, `logs/2026-09-13.md`, `context.md`).
+  if (path === 'context.md') return { category: 'context', slug: 'context', path: 'context.md' };
+  if (path === 'README.md') return { category: 'readme', slug: 'readme', path: 'README.md' };
+  const rel = path.match(/^sources\/(contributors|research|raw)\/(.+)$/) ?? path.match(/^(logs|artifacts)\/(.+)$/);
+  if (rel) return { category: rel[1]!, slug: slugOf(rel[2]!), path: rel[2]! };
   // TODO(v2): legacy caller passed (slug, wiki/notes/<slug>.md). Strip the
   // v1 `wiki/notes/` prefix and route to research/ by default. Wiki pages
   // live in wiki/concepts/ under v1 — the server falls back between the

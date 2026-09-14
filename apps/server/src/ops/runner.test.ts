@@ -11,14 +11,20 @@ import type { ChatChunk, ChatMessage } from '@mindbase/core';
 
 let root: string;
 
-function scriptedCtx(outputs: string[]): OpsCtx {
+/**
+ * Fake LLM that replays `outputs` in order. When `captured` is given, every
+ * request's messages are pushed onto it so tests can assert on the prompt.
+ */
+function scriptedCtx(outputs: string[], captured?: ChatMessage[][]): OpsCtx {
   let call = 0;
   return {
     projectRoot: root,
     projectId: 'test-proj',
+    user: 'u',
     config: { model: 'fake-model' },
     getAdapter: () => ({
-      chat: (_req: { model: string; messages: ChatMessage[] }): AsyncIterable<ChatChunk> => {
+      chat: (req: { model: string; messages: ChatMessage[] }): AsyncIterable<ChatChunk> => {
+        captured?.push(req.messages);
         const text = outputs[Math.min(call++, outputs.length - 1)]!;
         return (async function* () {
           yield { kind: 'delta', text } as ChatChunk;
@@ -82,6 +88,119 @@ describe('contribute plan → apply', () => {
     const c = collect();
     await applyContributePlan('nope-id', [0], c.emit);
     expect(c.events.some((e) => e.kind === 'error')).toBe(true);
+  });
+});
+
+describe('contribute: source layer + duplicate guard', () => {
+  const today = () => new Date().toISOString().slice(0, 10);
+  const dailyRel = () => `sources/contributors/u/${today()}.md`;
+  const planWith = (...slugs: string[]) => JSON.stringify({
+    takeaways: ['t'],
+    plan: [
+      ...slugs.map((slug) => ({ kind: 'create_research_page', slug, markdown: `# ${slug}\n\nbody [@sources/contributors/u/x.md]` })),
+      { kind: 'append_context_section', section: 'Learnings', markdown: '- l' },
+    ],
+  });
+  const userPrompt = (captured: ChatMessage[][]) => captured[0]!.find((m) => m.role === 'user')!.content as string;
+  const planOf = (events: OpEvent[]) => {
+    const ev = events.find((e) => e.kind === 'plan');
+    if (!ev || ev.kind !== 'plan') throw new Error('no plan event');
+    return ev;
+  };
+
+  it('(a) free text lands in today\'s contributor file first and the prompt cites it', async () => {
+    const captured: ChatMessage[][] = [];
+    const c = collect();
+    await runContributePlan(scriptedCtx([planWith('idea')], captured), 'a fresh thought', c.emit);
+    expect(c.events.some((e) => e.kind === 'phase' && /saving to today/.test(e.phase))).toBe(true);
+    const daily = await readFile(join(root, dailyRel()), 'utf-8');
+    expect(daily).toContain(`# ${today()} — u\n`);
+    expect(daily).toContain('a fresh thought');
+    expect(userPrompt(captured)).toContain(`[@${dailyRel()}]`);
+    const log = await readFile(join(root, 'logs', `${today()}.md`), 'utf-8');
+    expect(log).toMatch(/contribute \| user=u bytes=15/);
+    expect(planOf(c.events).notes).toBeUndefined();
+  });
+
+  it('(b) with sourcePath given, no daily file is written and the prompt cites the given path', async () => {
+    const captured: ChatMessage[][] = [];
+    const c = collect();
+    const sourcePath = 'sources/contributors/u/notes/my-note.md';
+    await runContributePlan(scriptedCtx([planWith('idea')], captured), 'note body', c.emit, { sourcePath });
+    await expect(readFile(join(root, dailyRel()), 'utf-8')).rejects.toThrow();
+    expect(c.events.some((e) => e.kind === 'phase' && /saving to today/.test(e.phase))).toBe(false);
+    expect(userPrompt(captured)).toContain(`[@${sourcePath}]`);
+    expect(userPrompt(captured)).not.toContain(dailyRel());
+  });
+
+  it('prompt lists existing research slugs so the model can update instead of duplicating', async () => {
+    await writeFile(join(root, 'sources', 'research', 'deep-work.md'), '# Deep Work', 'utf-8');
+    const captured: ChatMessage[][] = [];
+    await runContributePlan(scriptedCtx([planWith()], captured), 'x', collect().emit);
+    expect(userPrompt(captured)).toMatch(/EXISTING RESEARCH PAGES[^\n]*\n[^\n]*deep-work/);
+  });
+
+  it('(c) create_research_page whose normalized slug matches an existing file is removed with a note', async () => {
+    await writeFile(join(root, 'sources', 'research', 'deep-work.md'), '# Deep Work', 'utf-8');
+    const c = collect();
+    // Model slug differs only by case/separator; the action schema itself
+    // requires kebab-case so use a valid slug that still normalizes equal.
+    await runContributePlan(scriptedCtx([planWith('deep--work')]), 'x', c.emit);
+    const plan = planOf(c.events);
+    expect(plan.plan.map((a) => a.kind)).toEqual(['append_context_section']);
+    expect(plan.notes).toHaveLength(1);
+    expect(plan.notes![0]).toContain('"deep--work"');
+    expect(plan.notes![0]).toContain('sources/research/deep-work.md');
+    expect(plan.notes![0]).toMatch(/already exists/);
+  });
+
+  it('(d) a slug reserved by a pending plan is refused until that plan is consumed', async () => {
+    const cA = collect();
+    await runContributePlan(scriptedCtx([planWith('foo')]), 'a', cA.emit);
+    const planA = planOf(cA.events);
+    expect(planA.plan).toHaveLength(2);
+    expect(planA.notes).toBeUndefined();
+
+    const cB = collect();
+    await runContributePlan(scriptedCtx([planWith('foo')]), 'b', cB.emit);
+    const planB = planOf(cB.events);
+    expect(planB.plan.map((a) => a.kind)).toEqual(['append_context_section']);
+    expect(planB.notes).toEqual(['Skipped creating "foo" — another pending plan is already creating it.']);
+
+    // Apply A selecting ONLY the context append — foo.md is never written,
+    // so the reservation is released and C may propose it again.
+    const cApply = collect();
+    await applyContributePlan(planA.planId, [1], cApply.emit);
+    expect((await readdir(join(root, 'sources', 'research')))).toEqual([]);
+
+    const cC = collect();
+    await runContributePlan(scriptedCtx([planWith('foo')]), 'c', cC.emit);
+    const planC = planOf(cC.events);
+    expect(planC.plan.map((a) => a.kind)).toEqual(['create_research_page', 'append_context_section']);
+    expect(planC.notes).toBeUndefined();
+
+    // Now actually create it via C; a later plan D hits the on-disk guard.
+    const cApplyC = collect();
+    await applyContributePlan(planC.planId, [0], cApplyC.emit);
+    expect((await readdir(join(root, 'sources', 'research')))).toEqual(['foo.md']);
+    const cD = collect();
+    await runContributePlan(scriptedCtx([planWith('foo')]), 'd', cD.emit);
+    const planD = planOf(cD.events);
+    expect(planD.plan.map((a) => a.kind)).toEqual(['append_context_section']);
+    expect(planD.notes).toEqual(['Skipped creating "foo" — a page for this already exists (sources/research/foo.md). Update it instead.']);
+  });
+
+  it('a plan whose every action was removed is still emitted (empty plan + notes)', async () => {
+    await writeFile(join(root, 'sources', 'research', 'foo.md'), '# Foo', 'utf-8');
+    const onlyCreate = JSON.stringify({ takeaways: ['t'], plan: [{ kind: 'create_research_page', slug: 'foo', markdown: '# Foo' }] });
+    const c = collect();
+    await runContributePlan(scriptedCtx([onlyCreate]), 'x', c.emit);
+    const plan = planOf(c.events);
+    expect(plan.plan).toEqual([]);
+    expect(plan.notes).toHaveLength(1);
+    const cApply = collect();
+    await applyContributePlan(plan.planId, [], cApply.emit);
+    expect(cApply.events.some((e) => e.kind === 'error' && /No actions selected/.test(e.error))).toBe(true);
   });
 });
 
