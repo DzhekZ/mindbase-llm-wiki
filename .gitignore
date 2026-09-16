@@ -21,3 +21,4 @@ atlas.config.json
 
 # Local settings
 .claude/
+.vs/
